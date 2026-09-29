@@ -1,15 +1,17 @@
 """MediaDockのGUI。"""
 
-"""MediaDockのGUI。"""
-
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
+import zipfile
 from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -23,6 +25,16 @@ def get_application_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_resource_path(relative_path: str) -> Path:
+    """PyInstallerに格納したリソースのパスを取得する。"""
+    if getattr(sys, "frozen", False):
+        base_directory = Path(sys._MEIPASS)
+    else:
+        base_directory = Path(__file__).resolve().parent
+
+    return base_directory / relative_path
+
+
 def get_subprocess_creationflags() -> int:
     """Windowsで子プロセスのコンソールウィンドウを表示しない。"""
     if os.name == "nt":
@@ -31,12 +43,152 @@ def get_subprocess_creationflags() -> int:
     return 0
 
 
+def download_yt_dlp(application_directory: Path) -> Path:
+    """yt-dlp.exeがなければ公式配布元からダウンロードする。"""
+    tools_directory = application_directory / "tools"
+    yt_dlp_path = tools_directory / "yt-dlp.exe"
+
+    if yt_dlp_path.is_file():
+        return yt_dlp_path
+
+    tools_directory.mkdir(parents=True, exist_ok=True)
+
+    download_url = (
+        "https://github.com/yt-dlp/yt-dlp-nightly-builds/"
+        "releases/latest/download/yt-dlp.exe"
+    )
+    temporary_path = tools_directory / "yt-dlp.exe.download"
+
+    try:
+        urllib.request.urlretrieve(
+            download_url,
+            temporary_path,
+        )
+        temporary_path.replace(yt_dlp_path)
+    except (OSError, urllib.error.URLError) as error:
+        temporary_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"yt-dlp.exeをダウンロードできませんでした: {error}"
+        ) from error
+
+    return yt_dlp_path
+
+
+def download_deno(application_directory: Path) -> Path:
+    """deno.exeがなければ公式配布元からダウンロードする。"""
+    tools_directory = application_directory / "tools"
+    deno_path = tools_directory / "deno.exe"
+
+    if deno_path.is_file():
+        return deno_path
+
+    tools_directory.mkdir(parents=True, exist_ok=True)
+
+    download_url = (
+        "https://github.com/denoland/deno/releases/latest/download/"
+        "deno-x86_64-pc-windows-msvc.zip"
+    )
+    zip_path = tools_directory / "deno.zip.download"
+    extract_directory = tools_directory / "deno.download"
+
+    try:
+        urllib.request.urlretrieve(
+            download_url,
+            zip_path,
+        )
+
+        extract_directory.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extract("deno.exe", extract_directory)
+
+        extracted_deno_path = extract_directory / "deno.exe"
+        extracted_deno_path.replace(deno_path)
+    except (OSError, urllib.error.URLError, zipfile.BadZipFile, KeyError) as error:
+        raise RuntimeError(
+            f"deno.exeをダウンロードできませんでした: {error}"
+        ) from error
+    finally:
+        zip_path.unlink(missing_ok=True)
+
+        if extract_directory.is_dir():
+            extracted_deno_path = extract_directory / "deno.exe"
+            extracted_deno_path.unlink(missing_ok=True)
+
+            try:
+                extract_directory.rmdir()
+            except OSError:
+                pass
+
+    return deno_path
+
+
+def download_ffmpeg(application_directory: Path) -> Path:
+    """FFmpegがなければWindows用Essentialsビルドをダウンロードする。"""
+    tools_directory = application_directory / "tools"
+    ffmpeg_directory = tools_directory / "ffmpeg"
+    ffmpeg_path = ffmpeg_directory / "ffmpeg.exe"
+    ffprobe_path = ffmpeg_directory / "ffprobe.exe"
+
+    if ffmpeg_path.is_file() and ffprobe_path.is_file():
+        return ffmpeg_directory
+
+    tools_directory.mkdir(parents=True, exist_ok=True)
+
+    download_url = (
+        "https://www.gyan.dev/ffmpeg/builds/"
+        "ffmpeg-release-essentials.zip"
+    )
+    zip_path = tools_directory / "ffmpeg.zip.download"
+    extract_directory = tools_directory / "ffmpeg.download"
+
+    try:
+        urllib.request.urlretrieve(
+            download_url,
+            zip_path,
+        )
+
+        extract_directory.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(extract_directory)
+
+        extracted_ffmpeg_path = next(
+            extract_directory.glob("*/bin/ffmpeg.exe")
+        )
+        extracted_ffprobe_path = next(
+            extract_directory.glob("*/bin/ffprobe.exe")
+        )
+
+        ffmpeg_directory.mkdir(parents=True, exist_ok=True)
+
+        extracted_ffmpeg_path.replace(ffmpeg_path)
+        extracted_ffprobe_path.replace(ffprobe_path)
+    except (
+        OSError,
+        urllib.error.URLError,
+        zipfile.BadZipFile,
+        StopIteration,
+    ) as error:
+        raise RuntimeError(
+            f"FFmpegをダウンロードできませんでした: {error}"
+        ) from error
+    finally:
+        zip_path.unlink(missing_ok=True)
+        shutil.rmtree(extract_directory, ignore_errors=True)
+
+    return ffmpeg_directory
+
+
 class MediaDockGUI:
     """動画情報を取得して表示する画面。"""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("MediaDock")
+        self.root.iconbitmap(
+            default=get_resource_path("assets/mediadock.ico")
+        )
 
         self.results: queue.Queue[tuple[bool, str]] = queue.Queue()
         self.download_results: queue.Queue[tuple[bool, str]] = queue.Queue()
@@ -45,6 +197,7 @@ class MediaDockGUI:
         self.cancel_requested = threading.Event()
         self.download_process: subprocess.Popen[str] | None = None
         self.download_process_lock = threading.Lock()
+        self.yt_dlp_update_checked = False
 
         self.application_directory = get_application_directory()
         self.settings_path = self.application_directory / "settings.json"
@@ -284,13 +437,44 @@ class MediaDockGUI:
 
         self.root.after(100, self.check_result)
 
+    def update_yt_dlp(self, yt_dlp_path: Path) -> None:
+        """1起動につき1回だけyt-dlpの更新を確認する。"""
+        if self.yt_dlp_update_checked:
+            return
+
+        self.yt_dlp_update_checked = True
+
+        try:
+            subprocess.run(
+                [
+                    str(yt_dlp_path),
+                    "--ignore-config",
+                    "-U",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=get_subprocess_creationflags(),
+            )
+        except OSError:
+            pass
+
     def run_yt_dlp(self, video_url: str) -> None:
         """yt-dlpを実行し、結果をキューに渡す。"""
-        yt_dlp_path = self.application_directory / "tools" / "yt-dlp.exe"
-        deno_path = self.application_directory / "tools" / "deno.exe"
+        try:
+            yt_dlp_path = download_yt_dlp(self.application_directory)
+        except RuntimeError as error:
+            self.results.put((False, str(error)))
+            return
 
-        if not yt_dlp_path.is_file():
-            self.results.put((False, f"yt-dlp.exeが見つかりません: {yt_dlp_path}"))
+        self.update_yt_dlp(yt_dlp_path)
+
+        try:
+            deno_path = download_deno(self.application_directory)
+        except RuntimeError as error:
+            self.results.put((False, str(error)))
             return
 
         command = [
@@ -491,14 +675,17 @@ class MediaDockGUI:
         output_directory: Path,
     ) -> None:
         """別スレッドでファイル確認とダウンロードを実行する。"""
-        yt_dlp_path = self.application_directory / "tools" / "yt-dlp.exe"
-        deno_path = self.application_directory / "tools" / "deno.exe"
-        ffmpeg_path = self.application_directory / "tools" / "ffmpeg"
+        try:
+            yt_dlp_path = download_yt_dlp(self.application_directory)
+        except RuntimeError as error:
+            self.download_results.put((False, str(error)))
+            return
 
-        if not yt_dlp_path.is_file():
-            self.download_results.put(
-                (False, f"yt-dlp.exeが見つかりません。\n{yt_dlp_path}")
-            )
+        deno_path = self.application_directory / "tools" / "deno.exe"
+        try:
+            ffmpeg_path = download_ffmpeg(self.application_directory)
+        except RuntimeError as error:
+            self.download_results.put((False, str(error)))
             return
 
         if not (ffmpeg_path / "ffmpeg.exe").is_file():
