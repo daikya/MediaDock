@@ -6,7 +6,7 @@ YouTube / TVerの動画取得を支援するWindows向けデスクトップア�
 
 - Windows向けデスクトップアプリ
 - yt-dlpを利用した動画取得
-- 必要な外部ツールを初回起動時に自動取得
+- 必要な外部ツールを利用時に自動取得
   - yt-dlp
   - Deno
   - FFmpeg
@@ -22,15 +22,21 @@ YouTube / TVerの動画取得を支援するWindows向けデスクトップア�
 
 ## インストール
 
-GitHub Releasesから `MediaDock.exe` を取得してください。
+GitHub Releasesから `MediaDock-v1.0.0-win64.zip` をダウンロードしてください。
 
-配置後、そのまま起動できます。
+ダウンロードしたZIPファイルを任意の場所へ展開し、`MediaDock.exe` を起動してください。
 
-初回起動時に必要なツールが自動的に準備されます。
+必要な外部ツールは、動画情報の取得やダウンロードを行った際に自動的に準備されます。
+
+### Windows Defender SmartScreenについて
+
+初回起動時に、Microsoft Defender SmartScreenによって「WindowsによってPCが保護されました」と表示される場合があります。
+
+GitHub ReleasesからダウンロードしたMediaDockであることを確認したうえで、「詳細情報」をクリックし、「実行」を選択してください。
 
 ## 使い方
 
-1. MediaDock.exeを起動
+1. `MediaDock.exe` を起動
 2. 動画URLを入力
 3. 「動画情報を取得」をクリック
 4. 画質を選択
@@ -46,4 +52,6 @@ GitHub Releasesから `MediaDock.exe` を取得してください。
 
 ## License
 
-MIT License
+MediaDock本体はMIT Licenseで公開されています。
+
+利用している外部ソフトウェアのライセンスについては、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
