@@ -43,6 +43,55 @@ def get_subprocess_creationflags() -> int:
     return 0
 
 
+def get_format_size(video_format: dict) -> int | None:
+    """動画形式のファイルサイズを取得する。"""
+    for key in ("filesize", "filesize_approx"):
+        size = video_format.get(key)
+
+        if isinstance(size, (int, float)) and not isinstance(size, bool):
+            if size > 0:
+                return int(size)
+
+    return None
+
+
+def format_file_size(size: int | None) -> str:
+    """ファイルサイズを読みやすい単位で表示する。"""
+    if size is None:
+        return "不明"
+
+    if size >= 1024**3:
+        return f"約 {size / 1024**3:.2f} GB"
+
+    if size >= 1024**2:
+        return f"約 {size / 1024**2:.1f} MB"
+
+    if size >= 1024:
+        return f"約 {size / 1024:.1f} KB"
+
+    return f"約 {size} B"
+
+
+def get_selected_formats_size(video_info: dict) -> int | None:
+    """yt-dlpが選択した形式の合計ファイルサイズを取得する。"""
+    requested_formats = video_info.get("requested_formats")
+
+    if isinstance(requested_formats, list) and requested_formats:
+        total_size = 0
+
+        for video_format in requested_formats:
+            size = get_format_size(video_format)
+
+            if size is None:
+                return None
+
+            total_size += size
+
+        return total_size
+
+    return get_format_size(video_info)
+
+
 def download_yt_dlp(application_directory: Path) -> Path:
     """yt-dlp.exeがなければ公式配布元からダウンロードする。"""
     tools_directory = application_directory / "tools"
@@ -193,6 +242,10 @@ class MediaDockGUI:
         self.results: queue.Queue[tuple[bool, str]] = queue.Queue()
         self.download_results: queue.Queue[tuple[bool, str]] = queue.Queue()
         self.download_progress: queue.Queue[float] = queue.Queue()
+        self.size_results: queue.Queue[tuple[str, int, int | None]] = queue.Queue()
+        self.size_check_scheduled = False
+        self.size_cache: dict[tuple[str, int], int | None] = {}
+        self.size_pending: set[tuple[str, int]] = set()
         self.fetched_video_url: str | None = None
         self.cancel_requested = threading.Event()
         self.download_process: subprocess.Popen[str] | None = None
@@ -280,7 +333,9 @@ class MediaDockGUI:
         )
 
         self.quality_combo.pack(anchor="w")
-
+        self.quality_combo.bind("<<ComboboxSelected>>", self.on_quality_changed)
+        self.file_size_label = ttk.Label(frame, text="推定ファイルサイズ: -")
+        self.file_size_label.pack(anchor="w", pady=(5, 0))
         ttk.Label(frame, text="保存先フォルダー").pack(
             anchor="w",
             pady=(15, 5),
@@ -410,6 +465,139 @@ class MediaDockGUI:
         self.output_directory_var.set(str(new_directory))
         self.status_label.config(text="保存先フォルダーを変更しました。")
 
+    def on_quality_changed(self, event: tk.Event | None = None) -> None:
+        """画質が変更されたときの処理。"""
+        video_url = self.fetched_video_url
+        selected_quality = self.quality_combo.get()
+
+        if not video_url or not selected_quality:
+            self.file_size_label.config(text="推定ファイルサイズ: -")
+            return
+
+        selected_height = int(selected_quality.removesuffix("p"))
+        cache_key = (video_url, selected_height)
+
+        if cache_key in self.size_cache:
+            size = self.size_cache[cache_key]
+            self.file_size_label.config(
+                text=f"推定ファイルサイズ: {format_file_size(size)}"
+            )
+            return
+
+        self.file_size_label.config(text="推定ファイルサイズ: 取得中...")
+
+        if cache_key not in self.size_pending:
+            self.size_pending.add(cache_key)
+
+            thread = threading.Thread(
+                target=self.run_size_estimation,
+                args=(video_url, selected_height),
+                daemon=True,
+            )
+            thread.start()
+
+        if not self.size_check_scheduled:
+            self.size_check_scheduled = True
+            self.root.after(100, self.check_size_result)
+
+    def run_size_estimation(
+        self,
+        video_url: str,
+        selected_height: int,
+    ) -> None:
+        """yt-dlpが選択した形式の推定ファイルサイズを取得する。"""
+        try:
+            yt_dlp_path = self.application_directory / "tools" / "yt-dlp.exe"
+            deno_path = self.application_directory / "tools" / "deno.exe"
+
+            is_youtube = (
+                "youtube.com" in video_url or "youtu.be" in video_url
+            )
+
+            if is_youtube:
+                format_selector = (
+                    f"bv*[vcodec^=avc1][height<={selected_height}]"
+                    f"+ba[acodec^=mp4a]/"
+                    f"b[vcodec^=avc1][acodec^=mp4a]"
+                    f"[height<={selected_height}]"
+                )
+            else:
+                format_selector = (
+                    f"bv*[height<={selected_height}]"
+                    f"+ba/b[height<={selected_height}]"
+                )
+
+            command = [
+                str(yt_dlp_path),
+                "--ignore-config",
+            ]
+
+            if is_youtube:
+                command.extend([
+                    "--no-js-runtimes",
+                    "--js-runtimes",
+                    f"deno:{deno_path}",
+                    "--cookies-from-browser",
+                    "firefox",
+                ])
+
+            command.extend([
+                "-f",
+                format_selector,
+                "--dump-single-json",
+                "--skip-download",
+                video_url,
+            ])
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=get_subprocess_creationflags(),
+            )
+
+            size = None
+
+            if result.returncode == 0:
+                video_info = json.loads(result.stdout)
+                size = get_selected_formats_size(video_info)
+
+            self.size_results.put((video_url, selected_height, size))
+
+        except (OSError, ValueError, TypeError):
+            self.size_results.put((video_url, selected_height, None))
+
+    def check_size_result(self) -> None:
+        """推定ファイルサイズの取得結果をGUIに反映する。"""
+        while True:
+            try:
+                video_url, selected_height, size = self.size_results.get_nowait()
+            except queue.Empty:
+                break
+
+            cache_key = (video_url, selected_height)
+
+            self.size_pending.discard(cache_key)
+            self.size_cache[cache_key] = size
+
+            if video_url != self.fetched_video_url:
+                continue
+
+            if self.quality_combo.get() != f"{selected_height}p":
+                continue
+
+            self.file_size_label.config(
+                text=f"推定ファイルサイズ: {format_file_size(size)}"
+            )
+
+        if self.size_pending:
+            self.root.after(100, self.check_size_result)
+        else:
+            self.size_check_scheduled = False
+
     def fetch_video_info(self) -> None:
         """別スレッドで動画情報を取得する。"""
         video_url = self.url_entry.get().strip()
@@ -421,13 +609,14 @@ class MediaDockGUI:
         self.fetch_button.config(state="disabled")
         self.download_button.config(state="disabled")
         self.fetched_video_url = None
+        self.size_cache.clear()
         self.status_label.config(text="動画情報を取得しています...")
         self.title_label.config(text="タイトル: -")
         self.id_label.config(text="動画ID: -")
 
         self.quality_combo.config(state="disabled", values=[])
         self.quality_combo.set("")
-
+        self.file_size_label.config(text="推定ファイルサイズ: -")
         thread = threading.Thread(
             target=self.run_yt_dlp,
             args=(video_url,),
@@ -588,9 +777,10 @@ class MediaDockGUI:
             state="readonly",
         )
         self.quality_combo.current(0)
-
         self.status_label.config(text="動画情報を取得しました。")
         self.download_button.config(state="normal")
+
+        self.on_quality_changed()
 
     def start_download(self) -> None:
         """GUIで選択した条件を使ってダウンロードを開始する。"""
