@@ -15,6 +15,30 @@ import zipfile
 from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import parse_qs, urlparse
+
+
+def is_youtube_playlist_url(url: str) -> bool:
+    """YouTubeのプレイリストURLかどうかを判定する。"""
+    parsed = urlparse(url)
+
+    hostname = (parsed.hostname or "").lower()
+
+    if hostname not in (
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+    ):
+        return False
+
+    query = parse_qs(parsed.query)
+    playlist_ids = query.get("list", [])
+
+    if not any(playlist_id.strip() for playlist_id in playlist_ids):
+        return False
+
+    return parsed.path in ("/playlist", "/watch")
 
 
 def get_application_directory() -> Path:
@@ -242,14 +266,27 @@ class MediaDockGUI:
         self.results: queue.Queue[tuple[bool, str]] = queue.Queue()
         self.download_results: queue.Queue[tuple[bool, str]] = queue.Queue()
         self.download_progress: queue.Queue[float] = queue.Queue()
+        self.playlist_download_status: queue.Queue[
+            tuple[int, int, str]
+        ] = queue.Queue()
         self.size_results: queue.Queue[tuple[str, int, int | None]] = queue.Queue()
+        self.playlist_size_results: queue.Queue[
+            tuple[str, int, int, int, int]
+        ] = queue.Queue()
+        self.playlist_size_pending: set[tuple[str, int]] = set()
+        self.playlist_size_cache: dict[
+            tuple[str, int], tuple[int, int, int]
+        ] = {}
+        self.playlist_size_check_scheduled = False
         self.size_check_scheduled = False
         self.size_cache: dict[tuple[str, int], int | None] = {}
         self.size_pending: set[tuple[str, int]] = set()
         self.fetched_video_url: str | None = None
+        self.playlist_videos: list[dict] = []
         self.cancel_requested = threading.Event()
         self.download_process: subprocess.Popen[str] | None = None
         self.download_process_lock = threading.Lock()
+        self.download_process_termination_requested = False
         self.yt_dlp_update_checked = False
 
         self.application_directory = get_application_directory()
@@ -288,8 +325,11 @@ class MediaDockGUI:
 
         self.root.update_idletasks()
 
-        window_width = 640
-        window_height = 540
+        self.normal_window_width = 640
+        self.normal_window_height = 540
+
+        window_width = self.normal_window_width
+        window_height = self.normal_window_height
 
         if self.window_x is None or self.window_y is None:
             screen_width = self.root.winfo_screenwidth()
@@ -340,7 +380,35 @@ class MediaDockGUI:
 
         self.id_label = ttk.Label(frame, text="動画ID: -")
         self.id_label.pack(anchor="w", pady=5)
+        # プレイリスト内の動画一覧
+        self.playlist_frame = ttk.Frame(frame)
 
+        self.playlist_listbox = tk.Listbox(
+            self.playlist_frame,
+            height=5,
+            exportselection=False,
+        )
+
+        self.playlist_scrollbar = ttk.Scrollbar(
+            self.playlist_frame,
+            orient="vertical",
+            command=self.playlist_listbox.yview,
+        )
+
+        self.playlist_listbox.config(
+            yscrollcommand=self.playlist_scrollbar.set
+        )
+
+        self.playlist_listbox.pack(
+            side="left",
+            fill="both",
+            expand=True,
+        )
+
+        self.playlist_scrollbar.pack(
+            side="right",
+            fill="y",
+        )
         ttk.Label(frame, text="画質").pack(anchor="w", pady=(10, 5))
 
         self.quality_combo = ttk.Combobox(
@@ -413,6 +481,52 @@ class MediaDockGUI:
         self.progress_label.pack(anchor="w")
         self.url_entry.focus_set()
         self.root.protocol("WM_DELETE_WINDOW", self.close_window)
+
+    def adjust_window_height(self, playlist_visible: bool) -> None:
+        """プレイリスト表示に応じてウィンドウの高さを調整する。"""
+        self.root.update_idletasks()
+
+        if playlist_visible:
+            desired_height = max(
+                self.normal_window_height,
+                self.root.winfo_reqheight(),
+            )
+        else:
+            desired_height = self.normal_window_height
+
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            work_area = wintypes.RECT()
+
+            if ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(work_area), 0
+            ):
+                available_top = work_area.top
+                available_bottom = work_area.bottom
+            else:
+                available_top = 0
+                available_bottom = self.root.winfo_screenheight()
+        else:
+            available_top = 0
+            available_bottom = self.root.winfo_screenheight()
+
+        available_height = available_bottom - available_top
+        target_height = min(desired_height, available_height)
+
+        current_x = self.root.winfo_x()
+        current_y = self.root.winfo_y()
+
+        target_y = max(
+            available_top,
+            min(current_y, available_bottom - target_height),
+        )
+
+        self.root.geometry(
+            f"{self.normal_window_width}x{target_height}"
+            f"+{current_x}+{target_y}"
+        )
 
     def close_window(self) -> None:
         """ウィンドウ位置を保存して終了する。"""
@@ -487,6 +601,43 @@ class MediaDockGUI:
 
     def on_quality_changed(self, event: tk.Event | None = None) -> None:
         """画質が変更されたときの処理。"""
+        if self.playlist_videos:
+            playlist_url = self.fetched_video_url
+            selected_quality = self.quality_combo.get()
+
+            if not playlist_url or not selected_quality:
+                return
+
+            selected_height = int(selected_quality.removesuffix("p"))
+            cache_key = (playlist_url, selected_height)
+
+            if cache_key in self.playlist_size_cache:
+                total_size, known_count, video_count = (
+                    self.playlist_size_cache[cache_key]
+                )
+                self.show_playlist_size(
+                    total_size, known_count, video_count
+                )
+                return
+
+            self.file_size_label.config(
+                text="合計推定ファイルサイズ: 取得中..."
+            )
+
+            if cache_key not in self.playlist_size_pending:
+                self.playlist_size_pending.add(cache_key)
+
+                threading.Thread(
+                    target=self.run_playlist_size_estimation,
+                    args=(playlist_url, selected_height),
+                    daemon=True,
+                ).start()
+
+            if not self.playlist_size_check_scheduled:
+                self.playlist_size_check_scheduled = True
+                self.root.after(100, self.check_playlist_size_result)
+
+            return
         video_url = self.fetched_video_url
         selected_quality = self.quality_combo.get()
 
@@ -590,6 +741,154 @@ class MediaDockGUI:
         except (OSError, ValueError, TypeError):
             self.size_results.put((video_url, selected_height, None))
 
+    def show_playlist_size(
+        self,
+        total_size: int,
+        known_count: int,
+        video_count: int,
+    ) -> None:
+        """プレイリストの推定ファイルサイズを表示する。"""
+        expected_count = len(self.playlist_videos)
+
+        if (
+            expected_count > 0
+            and known_count == expected_count
+            and video_count == expected_count
+        ):
+            self.file_size_label.config(
+                text=(
+                    "合計推定ファイルサイズ: "
+                    f"{format_file_size(total_size)}"
+                )
+            )
+        elif known_count > 0:
+            self.file_size_label.config(
+                text=(
+                    "合計推定ファイルサイズ: "
+                    f"{format_file_size(total_size)}"
+                    f"（{known_count}/{expected_count}本、取得分のみ）"
+                )
+            )
+        else:
+            self.file_size_label.config(
+                text="合計推定ファイルサイズ: 不明"
+            )
+
+    def check_playlist_size_result(self) -> None:
+        """プレイリストのサイズ取得結果をGUIへ反映する。"""
+        while True:
+            try:
+                (
+                    playlist_url,
+                    selected_height,
+                    total_size,
+                    known_count,
+                    video_count,
+                ) = self.playlist_size_results.get_nowait()
+            except queue.Empty:
+                break
+
+            cache_key = (playlist_url, selected_height)
+            self.playlist_size_pending.discard(cache_key)
+            self.playlist_size_cache[cache_key] = (
+                total_size,
+                known_count,
+                video_count,
+            )
+
+            if (
+                self.playlist_videos
+                and self.fetched_video_url == playlist_url
+                and self.quality_combo.get()
+                == f"{selected_height}p"
+            ):
+                self.show_playlist_size(
+                    total_size,
+                    known_count,
+                    video_count,
+                )
+
+        if self.playlist_size_pending:
+            self.root.after(100, self.check_playlist_size_result)
+        else:
+            self.playlist_size_check_scheduled = False
+
+    def run_playlist_size_estimation(
+        self,
+        playlist_url: str,
+        selected_height: int,
+    ) -> None:
+        """プレイリスト全体の推定ファイルサイズを取得する。"""
+        try:
+            yt_dlp_path = self.application_directory / "tools" / "yt-dlp.exe"
+            deno_path = self.application_directory / "tools" / "deno.exe"
+
+            format_selector = (
+                f"bv*[vcodec^=avc1][height<={selected_height}]"
+                f"+ba[acodec^=mp4a]/"
+                f"b[vcodec^=avc1][acodec^=mp4a]"
+                f"[height<={selected_height}]"
+            )
+
+            command = [
+                str(yt_dlp_path),
+                "--ignore-config",
+                "--no-js-runtimes",
+                "--js-runtimes",
+                f"deno:{deno_path}",
+                "--cookies-from-browser",
+                "firefox",
+                "--yes-playlist",
+                "--ignore-errors",
+                "-f",
+                format_selector,
+                "--dump-json",
+                "--skip-download",
+                playlist_url,
+            ]
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=get_subprocess_creationflags(),
+            )
+
+            total_size = 0
+            known_count = 0
+            video_count = 0
+
+            for line in result.stdout.splitlines():
+                if not line.strip():
+                    continue
+
+                video_info = json.loads(line)
+                video_count += 1
+
+                size = get_selected_formats_size(video_info)
+
+                if size is not None:
+                    total_size += size
+                    known_count += 1
+
+            self.playlist_size_results.put(
+                (
+                    playlist_url,
+                    selected_height,
+                    total_size,
+                    known_count,
+                    video_count,
+                )
+            )
+
+        except (OSError, ValueError, TypeError):
+            self.playlist_size_results.put(
+                (playlist_url, selected_height, 0, 0, 0)
+            )
+
     def check_size_result(self) -> None:
         """推定ファイルサイズの取得結果をGUIに反映する。"""
         while True:
@@ -629,6 +928,10 @@ class MediaDockGUI:
         self.fetch_button.config(state="disabled")
         self.download_button.config(state="disabled")
         self.fetched_video_url = None
+        self.playlist_videos = []
+        self.playlist_listbox.delete(0, tk.END)
+        self.playlist_frame.pack_forget()
+        self.adjust_window_height(playlist_visible=False)
         self.size_cache.clear()
         self.status_label.config(text="動画情報を取得しています...")
         self.title_label.config(text="タイトル: -")
@@ -637,8 +940,13 @@ class MediaDockGUI:
         self.quality_combo.config(state="disabled", values=[])
         self.quality_combo.set("")
         self.file_size_label.config(text="推定ファイルサイズ: -")
+        if is_youtube_playlist_url(video_url):
+            target = self.run_playlist_info
+        else:
+            target = self.run_yt_dlp
+
         thread = threading.Thread(
-            target=self.run_yt_dlp,
+            target=target,
             args=(video_url,),
             daemon=True,
         )
@@ -669,6 +977,84 @@ class MediaDockGUI:
             )
         except OSError:
             pass
+
+    def run_playlist_info(self, playlist_url: str) -> None:
+        """YouTubeプレイリストの動画一覧を取得する。"""
+        try:
+            yt_dlp_path = download_yt_dlp(self.application_directory)
+            deno_path = download_deno(self.application_directory)
+        except RuntimeError as error:
+            self.results.put((False, str(error)))
+            return
+
+        self.update_yt_dlp(yt_dlp_path)
+
+        command = [
+            str(yt_dlp_path),
+            "--ignore-config",
+            "--no-js-runtimes",
+            "--js-runtimes",
+            f"deno:{deno_path}",
+            "--cookies-from-browser",
+            "firefox",
+            "--flat-playlist",
+            "--dump-single-json",
+            "--skip-download",
+            playlist_url,
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=get_subprocess_creationflags(),
+            )
+        except OSError as error:
+            self.results.put(
+                (False, f"プレイリスト情報の取得に失敗しました: {error}")
+            )
+            return
+
+        if result.returncode != 0:
+            message = result.stderr.strip() or "原因不明のエラーです。"
+            self.results.put(
+                (False, f"プレイリスト情報の取得に失敗しました: {message}")
+            )
+            return
+
+        try:
+            playlist_info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            self.results.put(
+                (False, "プレイリスト情報の解析に失敗しました。")
+            )
+            return
+
+        entries = playlist_info.get("entries") or []
+
+        videos = [
+            {
+                "id": entry.get("id"),
+                "title": entry.get("title") or "タイトル不明",
+            }
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("id")
+        ]
+
+        payload = {
+            "type": "playlist",
+            "url": playlist_url,
+            "title": playlist_info.get("title") or "タイトル不明",
+            "videos": videos,
+        }
+
+        self.results.put(
+            (True, json.dumps(payload, ensure_ascii=False))
+        )
 
     def run_yt_dlp(self, video_url: str) -> None:
         """yt-dlpを実行し、結果をキューに渡す。"""
@@ -777,7 +1163,66 @@ class MediaDockGUI:
             self.status_label.config(text=message)
             return
 
-        video_url, title, video_id, available_heights = json.loads(message)
+
+        result = json.loads(message)
+
+        if isinstance(result, dict) and result.get("type") == "playlist":
+            self.fetched_video_url = result["url"]
+            self.playlist_videos = result["videos"]
+
+            playlist_title = result["title"]
+            video_count = len(self.playlist_videos)
+
+            self.title_label.config(
+                text=f"プレイリスト名: {playlist_title}"
+            )
+            self.id_label.config(
+                text=f"動画件数: {video_count}件"
+            )
+            self.playlist_listbox.delete(0, tk.END)
+
+            for index, video in enumerate(self.playlist_videos, start=1):
+                title = video.get("title") or "タイトル不明"
+                self.playlist_listbox.insert(
+                    tk.END,
+                    f"{index}. {title}",
+                )
+
+            self.playlist_frame.pack(
+                fill="x",
+                pady=(5, 10),
+                before=self.quality_combo,
+            )
+            self.adjust_window_height(playlist_visible=True)
+            self.status_label.config(
+                text="プレイリスト情報を取得しました。"
+            )
+
+            # プレイリスト全体に適用する画質の上限
+            quality_values = [
+                "1080p",
+                "720p",
+                "480p",
+                "360p",
+                "240p",
+                "144p",
+            ]
+
+            self.quality_combo.config(
+                values=quality_values,
+                state="readonly",
+            )
+            self.quality_combo.current(0)
+            self.on_quality_changed()
+
+            if video_count > 0:
+                self.download_button.config(state="normal")
+            else:
+                self.download_button.config(state="disabled")
+
+            return
+
+        video_url, title, video_id, available_heights = result
         self.fetched_video_url = video_url
 
         self.title_label.config(text=f"タイトル: {title}")
@@ -847,24 +1292,29 @@ class MediaDockGUI:
         self.progress_bar["value"] = 0
         self.progress_label.config(text="現在のファイル: 0%")
 
+        if self.playlist_videos:
+            download_target = self.run_playlist_download
+        else:
+            download_target = self.run_download
+
         threading.Thread(
-            target=self.run_download,
+            target=download_target,
             args=(video_url, selected_height, output_directory),
             daemon=True,
         ).start()
 
         self.root.after(100, self.check_download_result)
 
-    def cancel_download(self) -> None:
-        """ダウンロードのキャンセルを要求する。"""
-        self.cancel_requested.set()
-        self.cancel_button.config(state="disabled")
-        self.status_label.config(text="キャンセル処理中...")
 
-        with self.download_process_lock:
-            process = self.download_process
+    def terminate_download_process(
+        self,
+        process: subprocess.Popen[str],
+    ) -> None:
+        """実行中の外部プロセスの終了を要求する。"""
+        if process.poll() is not None:
+            return
 
-        if process is not None and process.poll() is None:
+        try:
             if os.name == "nt":
                 subprocess.Popen(
                     [
@@ -880,6 +1330,337 @@ class MediaDockGUI:
                 )
             else:
                 process.terminate()
+        except OSError:
+            # 終了要求と同時にプロセスが終了する場合がある。
+            pass
+
+    def request_download_process_termination(
+        self,
+        process: subprocess.Popen[str],
+    ) -> None:
+        """同じプロセスへの終了要求を一度だけ発行する。
+
+        呼び出し元は download_process_lock を取得していること。
+        """
+        if self.download_process is not process:
+            return
+
+        if self.download_process_termination_requested:
+            return
+
+        if process.poll() is not None:
+            return
+
+        self.download_process_termination_requested = True
+        self.terminate_download_process(process)
+
+    def cancel_download(self) -> None:
+        """ダウンロードのキャンセルを要求する。"""
+        self.cancel_requested.set()
+        self.cancel_button.config(state="disabled")
+        self.status_label.config(text="キャンセル処理中...")
+
+        with self.download_process_lock:
+            process = self.download_process
+
+            if process is not None:
+                self.request_download_process_termination(process)
+
+    def run_playlist_download(
+        self,
+        playlist_url: str,
+        selected_height: int,
+        output_directory: Path,
+    ) -> None:
+        """プレイリスト内の動画を順番にダウンロードする。"""
+        try:
+            yt_dlp_path = download_yt_dlp(self.application_directory)
+            deno_path = download_deno(self.application_directory)
+            ffmpeg_path = download_ffmpeg(self.application_directory)
+        except RuntimeError as error:
+            self.download_results.put((False, str(error)))
+            return
+
+        if not deno_path.is_file():
+            self.download_results.put(
+                (False, f"deno.exeが見つかりません。\n{deno_path}")
+            )
+            return
+
+        if not (ffmpeg_path / "ffmpeg.exe").is_file():
+            self.download_results.put(
+                (False, f"ffmpeg.exeが見つかりません。\n{ffmpeg_path}")
+            )
+            return
+
+        videos = list(self.playlist_videos)
+
+        if not videos:
+            self.download_results.put(
+                (False, "プレイリストに動画がありません。")
+            )
+            return
+
+        total_count = len(videos)
+        downloaded_count = 0
+        skipped_count = 0
+        failed_count = 0
+        failed_videos: list[str] = []
+
+        for index, video in enumerate(videos, start=1):
+            self.playlist_download_status.put(
+                (index, total_count, "確認中")
+            )
+            if self.cancel_requested.is_set():
+                self.download_results.put(
+                    (False, "キャンセルしました。")
+                )
+                return
+
+            video_id = video.get("id")
+
+            if not video_id:
+                continue
+
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+            format_selector = (
+                f"bv*[vcodec^=avc1][height<={selected_height}]"
+                f"+ba[acodec^=mp4a]/"
+                f"b[vcodec^=avc1][acodec^=mp4a]"
+                f"[height<={selected_height}]"
+            )
+
+            base_command = [
+                str(yt_dlp_path),
+                "--ignore-config",
+                "--no-js-runtimes",
+                "--js-runtimes",
+                f"deno:{deno_path}",
+                "--cookies-from-browser",
+                "firefox",
+                "--no-playlist",
+                "--ffmpeg-location",
+                str(ffmpeg_path),
+                "-f",
+                format_selector,
+                "--merge-output-format",
+                "mp4",
+                "-o",
+                str(output_directory / "%(title)s [%(id)s].%(ext)s"),
+            ]
+
+            filename_command = base_command + [
+                "--simulate",
+                "--print",
+                "filename",
+                "--encoding",
+                "utf-8",
+                video_url,
+            ]
+
+            try:
+                with subprocess.Popen(
+                    filename_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=get_subprocess_creationflags(),
+                ) as process:
+                    with self.download_process_lock:
+                        self.download_process = process
+                        self.download_process_termination_requested = False
+
+                        if self.cancel_requested.is_set():
+                            self.request_download_process_termination(process)
+
+                    stdout, stderr = process.communicate()
+                    filename_result = subprocess.CompletedProcess(
+                        args=filename_command,
+                        returncode=process.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+
+            except OSError as error:
+                if self.cancel_requested.is_set():
+                    self.download_results.put(
+                        (False, "キャンセルしました。")
+                    )
+                    return
+
+                failed_count += 1
+                failed_videos.append(
+                    f"{index}/{total_count}本目: "
+                    f"{video.get('title', 'タイトル不明')}"
+                    f"（ファイル名確認エラー: {error}）"
+                )
+                continue
+
+            finally:
+                with self.download_process_lock:
+                    self.download_process = None
+
+            if self.cancel_requested.is_set():
+                self.download_results.put(
+                    (False, "キャンセルしました。")
+                )
+                return
+
+            if filename_result.returncode != 0:
+                failed_count += 1
+                error_detail = (
+                    filename_result.stderr.strip()[-500:]
+                    or f"終了コード: {filename_result.returncode}"
+                )
+                failed_videos.append(
+                    f"{index}/{total_count}本目: "
+                    f"{video.get('title', 'タイトル不明')}"
+                    f"（ファイル名取得失敗: {error_detail}）"
+                )
+                continue
+
+            filenames = [
+                line.strip()
+                for line in filename_result.stdout.splitlines()
+                if line.strip()
+            ]
+
+            if len(filenames) != 1:
+                failed_count += 1
+                failed_videos.append(
+                    f"{index}/{total_count}本目: "
+                    f"{video.get('title', 'タイトル不明')}"
+                    "（保存予定ファイル名を一意に取得できませんでした）"
+                )
+                continue
+
+            expected_file = Path(filenames[0])
+
+            if expected_file.is_file():
+                skipped_count += 1
+                self.playlist_download_status.put(
+                    (index, total_count, "既存ファイルをスキップ")
+                )
+                continue
+
+            self.playlist_download_status.put(
+                (index, total_count, "ダウンロード中")
+            )
+
+            download_command = base_command + [
+                "--newline",
+                "--progress-template",
+                "download:MEDIADOCK_PROGRESS:%(progress._percent_str)s",
+                "--encoding",
+                "utf-8",
+                "--convert-thumbnails",
+                "jpg",
+                "--embed-thumbnail",
+                video_url,
+            ]
+
+            log_lines = deque(maxlen=30)
+
+            try:
+                with subprocess.Popen(
+                    download_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=get_subprocess_creationflags(),
+                ) as process:
+                    with self.download_process_lock:
+                        self.download_process = process
+                        self.download_process_termination_requested = False
+
+                        if self.cancel_requested.is_set():
+                            self.request_download_process_termination(process)
+
+                    assert process.stdout is not None
+
+                    for line in process.stdout:
+                        log_lines.append(line.rstrip())
+
+                        match = re.search(
+                            r"MEDIADOCK_PROGRESS:\s*([\d.]+)%",
+                            line,
+                        )
+
+                        if match:
+                            percent = float(match.group(1))
+                            self.download_progress.put(percent)
+
+                    return_code = process.wait()
+
+            except OSError as error:
+                if self.cancel_requested.is_set():
+                    self.download_results.put(
+                        (False, "キャンセルしました。")
+                    )
+                    return
+
+                failed_count += 1
+                failed_videos.append(
+                    f"{index}/{total_count}本目: "
+                    f"{video.get('title', 'タイトル不明')}"
+                    f"（ダウンロード実行エラー: {error}）"
+                )
+                continue
+
+            finally:
+                with self.download_process_lock:
+                    self.download_process = None
+
+            if self.cancel_requested.is_set():
+                self.download_results.put(
+                    (False, "キャンセルしました。")
+                )
+                return
+
+            if return_code != 0:
+                failed_count += 1
+                error_log = "\n".join(log_lines)[-500:]
+
+                failed_videos.append(
+                    f"{index}/{total_count}本目: "
+                    f"{video.get('title', 'タイトル不明')}"
+                    f"（終了コード: {return_code}）\n"
+                    f"{error_log}"
+                )
+                continue
+
+            downloaded_count += 1
+
+        if failed_count == 0:
+            result_title = "プレイリストのダウンロードが完了しました。"
+            success = True
+        elif downloaded_count + skipped_count > 0:
+            result_title = "プレイリストの処理が一部失敗しました。"
+            success = False
+        else:
+            result_title = "プレイリストのダウンロードがすべて失敗しました。"
+            success = False
+
+        result_message = (
+            f"{result_title}\n"
+            f"対象動画数: {total_count}本\n"
+            f"ダウンロード成功: {downloaded_count}本\n"
+            f"既存ファイルをスキップ: {skipped_count}本\n"
+            f"失敗: {failed_count}本"
+        )
+
+        if failed_videos:
+            result_message += (
+                "\n\n失敗した動画:\n"
+                + "\n".join(failed_videos)
+            )
+
+        self.download_results.put((success, result_message))
 
     def run_download(
         self,
@@ -1039,23 +1820,10 @@ class MediaDockGUI:
             ) as process:
                 with self.download_process_lock:
                     self.download_process = process
+                    self.download_process_termination_requested = False
 
-                if self.cancel_requested.is_set():
-                    if os.name == "nt":
-                        subprocess.Popen(
-                            [
-                                "taskkill",
-                                "/PID",
-                                str(process.pid),
-                                "/T",
-                                "/F",
-                            ],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=get_subprocess_creationflags(),
-                        )
-                    else:
-                        process.terminate()
+                    if self.cancel_requested.is_set():
+                        self.request_download_process_termination(process)
 
                 assert process.stdout is not None
 
@@ -1117,6 +1885,26 @@ class MediaDockGUI:
         """ダウンロードの進捗と結果をGUIに反映する。"""
         while True:
             try:
+                index, total_count, status = (
+                    self.playlist_download_status.get_nowait()
+                )
+            except queue.Empty:
+                break
+
+            self.status_label.config(
+                text=(
+                    "プレイリストを処理しています "
+                    f"（{index}/{total_count}本目・{status}）"
+                )
+            )
+
+            if status in ("確認中", "ダウンロード中"):
+                self.progress_bar["value"] = 0
+                self.progress_label.config(
+                    text="現在のファイル: 0%"
+                )
+        while True:
+            try:
                 percent = self.download_progress.get_nowait()
             except queue.Empty:
                 break
@@ -1160,13 +1948,20 @@ class MediaDockGUI:
                 parent=self.root,
             )
         else:
-            self.status_label.config(text="ダウンロードに失敗しました。")
+            self.status_label.config(text=message.splitlines()[0])
 
-            messagebox.showerror(
-                "MediaDock",
-                message,
-                parent=self.root,
-            )
+            if message.startswith("プレイリストの処理が一部失敗しました。"):
+                messagebox.showwarning(
+                    "MediaDock",
+                    message,
+                    parent=self.root,
+                )
+            else:
+                messagebox.showerror(
+                    "MediaDock",
+                    message,
+                    parent=self.root,
+                )
 
 
 def main() -> None:
