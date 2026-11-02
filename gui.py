@@ -254,6 +254,7 @@ class MediaDockGUI:
 
         self.application_directory = get_application_directory()
         self.settings_path = self.application_directory / "settings.json"
+        self.auto_download_enabled = False
 
         self.output_directory = Path.home() / "Downloads"
         self.window_x: int | None = None
@@ -264,7 +265,9 @@ class MediaDockGUI:
                 settings = json.loads(
                     self.settings_path.read_text(encoding="utf-8")
                 )
-
+                self.auto_download_enabled = (
+                    settings.get("auto_download", False) is True
+                )
                 saved_directory = settings.get("output_directory")
 
                 if saved_directory:
@@ -307,12 +310,27 @@ class MediaDockGUI:
         self.url_entry = ttk.Entry(frame)
         self.url_entry.pack(fill="x", pady=(5, 10))
 
+        # 動画情報取得ボタンと自動ダウンロード設定
+        fetch_frame = ttk.Frame(frame)
+        fetch_frame.pack(anchor="w")
+
         self.fetch_button = ttk.Button(
-            frame,
+            fetch_frame,
             text="動画情報を取得",
             command=self.fetch_video_info,
         )
-        self.fetch_button.pack(anchor="w")
+        self.fetch_button.pack(side="left")
+
+        self.auto_download_var = tk.BooleanVar(
+            value=self.auto_download_enabled
+        )
+
+        self.auto_download_check = ttk.Checkbutton(
+            fetch_frame,
+            text="取得後に自動ダウンロード",
+            variable=self.auto_download_var,
+        )
+        self.auto_download_check.pack(side="left", padx=(15, 0))
 
         self.status_label = ttk.Label(frame, text="動画URLを入力してください。")
         self.status_label.pack(anchor="w", pady=(15, 5))
@@ -402,6 +420,7 @@ class MediaDockGUI:
             "output_directory": str(self.output_directory.resolve()),
             "window_x": self.root.winfo_x(),
             "window_y": self.root.winfo_y(),
+            "auto_download": self.auto_download_var.get(),
         }
 
         try:
@@ -447,6 +466,7 @@ class MediaDockGUI:
                         "output_directory": str(new_directory.resolve()),
                         "window_x": self.root.winfo_x(),
                         "window_y": self.root.winfo_y(),
+                        "auto_download": self.auto_download_var.get(),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -781,6 +801,9 @@ class MediaDockGUI:
         self.download_button.config(state="normal")
 
         self.on_quality_changed()
+
+        if self.auto_download_var.get():
+            self.start_download()
 
     def start_download(self) -> None:
         """GUIで選択した条件を使ってダウンロードを開始する。"""
