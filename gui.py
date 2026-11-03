@@ -1220,6 +1220,9 @@ class MediaDockGUI:
             else:
                 self.download_button.config(state="disabled")
 
+            if video_count > 0 and self.auto_download_var.get():
+                self.start_download()
+
             return
 
         video_url, title, video_id, available_heights = result

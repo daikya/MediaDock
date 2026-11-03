@@ -3,6 +3,7 @@
 
 import queue
 import threading
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -432,3 +433,183 @@ def test_download_process_termination_is_thread_safe() -> None:
 
     terminate_mock.assert_called_once_with(process)
     assert application.download_process_termination_requested is True
+
+
+def test_playlist_auto_download_enabled() -> None:
+    """プレイリスト取得後、自動ダウンロードONなら開始する。"""
+    application = object.__new__(gui.MediaDockGUI)
+
+    application.results = queue.Queue()
+    application.results.put(
+        (
+            True,
+            json.dumps(
+                {
+                    "type": "playlist",
+                    "url": "https://www.youtube.com/playlist?list=test123",
+                    "title": "テストプレイリスト",
+                    "videos": [
+                        {
+                            "id": "video1",
+                            "title": "テスト動画1",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+
+    application.fetch_button = MagicMock()
+    application.title_label = MagicMock()
+    application.id_label = MagicMock()
+    application.playlist_listbox = MagicMock()
+    application.playlist_frame = MagicMock()
+    application.quality_combo = MagicMock()
+    application.status_label = MagicMock()
+    application.download_button = MagicMock()
+    application.auto_download_var = MagicMock()
+    application.auto_download_var.get.return_value = True
+
+    with (
+        patch.object(application, "adjust_window_height"),
+        patch.object(application, "on_quality_changed"),
+        patch.object(application, "start_download") as download_mock,
+    ):
+        application.check_result()
+
+    download_mock.assert_called_once_with()
+    assert len(application.playlist_videos) == 1
+
+
+def test_playlist_auto_download_disabled() -> None:
+    """プレイリスト取得後、自動ダウンロードOFFなら開始しない。"""
+    application = object.__new__(gui.MediaDockGUI)
+
+    application.results = queue.Queue()
+    application.results.put(
+        (
+            True,
+            json.dumps(
+                {
+                    "type": "playlist",
+                    "url": "https://www.youtube.com/playlist?list=test123",
+                    "title": "テストプレイリスト",
+                    "videos": [
+                        {
+                            "id": "video1",
+                            "title": "テスト動画1",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+
+    application.fetch_button = MagicMock()
+    application.title_label = MagicMock()
+    application.id_label = MagicMock()
+    application.playlist_listbox = MagicMock()
+    application.playlist_frame = MagicMock()
+    application.quality_combo = MagicMock()
+    application.status_label = MagicMock()
+    application.download_button = MagicMock()
+    application.auto_download_var = MagicMock()
+    application.auto_download_var.get.return_value = False
+
+    with (
+        patch.object(application, "adjust_window_height"),
+        patch.object(application, "on_quality_changed"),
+        patch.object(application, "start_download") as download_mock,
+    ):
+        application.check_result()
+
+    download_mock.assert_not_called()
+    assert len(application.playlist_videos) == 1
+    application.download_button.config.assert_called_with(state="normal")
+
+
+def test_playlist_auto_download_with_no_videos() -> None:
+    """動画0件のプレイリストでは自動ダウンロードを開始しない。"""
+    application = object.__new__(gui.MediaDockGUI)
+
+    application.results = queue.Queue()
+    application.results.put(
+        (
+            True,
+            json.dumps(
+                {
+                    "type": "playlist",
+                    "url": "https://www.youtube.com/playlist?list=test123",
+                    "title": "空のプレイリスト",
+                    "videos": [],
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+
+    application.fetch_button = MagicMock()
+    application.title_label = MagicMock()
+    application.id_label = MagicMock()
+    application.playlist_listbox = MagicMock()
+    application.playlist_frame = MagicMock()
+    application.quality_combo = MagicMock()
+    application.status_label = MagicMock()
+    application.download_button = MagicMock()
+    application.auto_download_var = MagicMock()
+    application.auto_download_var.get.return_value = True
+
+    with (
+        patch.object(application, "adjust_window_height"),
+        patch.object(application, "on_quality_changed"),
+        patch.object(application, "start_download") as download_mock,
+    ):
+        application.check_result()
+
+    download_mock.assert_not_called()
+    assert application.playlist_videos == []
+    application.download_button.config.assert_called_with(state="disabled")
+
+
+def test_single_video_auto_download_enabled() -> None:
+    """単体動画取得後、自動ダウンロードONなら開始する。"""
+    application = object.__new__(gui.MediaDockGUI)
+
+    application.results = queue.Queue()
+    application.results.put(
+        (
+            True,
+            json.dumps(
+                [
+                    "https://www.youtube.com/watch?v=test123",
+                    "テスト動画",
+                    "test123",
+                    [1080, 720, 480],
+                ],
+                ensure_ascii=False,
+            ),
+        )
+    )
+
+    application.fetch_button = MagicMock()
+    application.title_label = MagicMock()
+    application.id_label = MagicMock()
+    application.quality_combo = MagicMock()
+    application.status_label = MagicMock()
+    application.download_button = MagicMock()
+    application.auto_download_var = MagicMock()
+    application.auto_download_var.get.return_value = True
+
+    with (
+        patch.object(application, "on_quality_changed"),
+        patch.object(application, "start_download") as download_mock,
+    ):
+        application.check_result()
+
+    download_mock.assert_called_once_with()
+    assert application.fetched_video_url == (
+        "https://www.youtube.com/watch?v=test123"
+    )
+    application.download_button.config.assert_called_with(state="normal")
