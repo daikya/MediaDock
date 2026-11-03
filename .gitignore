@@ -6,3 +6,4 @@ dist/
 tools/
 build/
 *.spec
+!MediaDock.spec
